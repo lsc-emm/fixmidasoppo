@@ -1,98 +1,42 @@
-name: Build midas_fix.ko (GKI 5.10 Android12)
-on: [push, workflow_dispatch]
+name: Build midas_fix.ko with DDK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      ddk_image:
+        description: 'DDK Docker image tag (需匹配设备内核日期)'
+        required: false
+        default: 'ghcr.io/ylarod/ddk-min:android12-5.10-20221204'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # 1. 只检查必需工具，缺了才用 apt（加重试 + 强制 IPv4）
-      - name: Ensure build tools
+      - name: Show DDK image
         run: |
-          need_apt=0
-          for t in flex bison bc make gcc; do
-            command -v $t >/dev/null 2>&1 || need_apt=1
-          done
-          [ -f /usr/include/openssl/ssl.h ] || need_apt=1
-          [ -f /usr/include/elf.h ] || need_apt=1
+          echo "使用镜像: ${{ inputs.ddk_image || 'ghcr.io/ylarod/ddk-min:android12-5.10-20221204' }}"
 
-          if [ "$need_apt" = "1" ]; then
-            echo "部分工具缺失，尝试 apt 安装（强制 IPv4 + 重试）"
-            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-              [ -f "$f" ] && sudo sed -i \
-                -e 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
-                -e 's|security.ubuntu.com|archive.ubuntu.com|g' "$f" || true
-            done
-            for i in 1 2 3; do
-              sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update && break
-              echo "apt update 第 $i 次失败，重试..."
-              sleep 15
-            done
-            sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends \
-              flex bison bc libelf-dev libssl-dev || true
-          else
-            echo "所有必需工具已预装，跳过 apt"
-          fi
-
-      # 2. 从 GitHub Releases 下载 LLVM（不依赖 apt 源）
-      - name: Install clang/lld from LLVM tarball
+      - name: Build .ko with DDK Docker
         run: |
-          LLVM_VER=17.0.6
-          TARBALL="clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
-          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/${TARBALL}"
+          IMAGE="${{ inputs.ddk_image || 'ghcr.io/ylarod/ddk-min:android12-5.10-20221204' }}"
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            "$IMAGE" \
+            make
 
-          # 带重试下载
-          for i in 1 2 3; do
-            wget -q --timeout=60 --tries=2 "$URL" -O "$TARBALL" && break
-            echo "下载 LLVM 第 $i 次失败，重试..."
-            sleep 10
-          done
-
-          tar -xf "$TARBALL"
-          LLVM_DIR="$PWD/clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-22.04"
-          echo "$LLVM_DIR/bin" >> $GITHUB_PATH
-
-          # 当前 step 内也生效
-          export PATH="$LLVM_DIR/bin:$PATH"
-          clang --version
-          ld.lld --version
-
-      # 3. 拉 GKI 源码
-      - name: Clone GKI kernel source (android12-5.10)
+      - name: List build output
         run: |
-          git clone --depth=1 -b android12-5.10 \
-            https://android.googlesource.com/kernel/common gki-source
+          ls -lh *.ko || true
+          file *.ko || true
 
-      # 4. 配置 GKI
-      - name: Configure GKI kernel
-        run: |
-          cd gki-source
-          make ARCH=arm64 LLVM=1 O=out gki_defconfig
-
-      # 5. 编译 vmlinux 生成 Module.symvers
-      - name: Build GKI vmlinux
-        run: |
-          cd gki-source
-          make ARCH=arm64 LLVM=1 O=out -j$(nproc) vmlinux
-          echo "==== Module.symvers ===="
-          ls -lh out/Module.symvers
-          head -3 out/Module.symvers
-
-      # 6. 编译外部模块
-      - name: Build external module
-        run: |
-          make -C gki-source \
-            ARCH=arm64 \
-            LLVM=1 \
-            M=$PWD \
-            KDIR=$PWD/gki-source/out
-          ls -lh *.ko
-          file midas_fix.ko
-
-      # 7. 上传 .ko
       - name: Upload .ko artifact
         uses: actions/upload-artifact@v4
         with:
