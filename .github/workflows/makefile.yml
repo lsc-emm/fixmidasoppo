@@ -4,34 +4,89 @@ on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # 1. 修 apt 源 + 安装 clang/lld 和内核编译依赖
+      - name: Install LLVM and build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev bc
+          # GitHub Actions runner 的 azure/security 源经常 DNS 失败，统一换 archive
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            [ -f "$f" ] && sudo sed -i \
+              -e 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
+              -e 's|security.ubuntu.com|archive.ubuntu.com|g' "$f" || true
+          done
 
+          # 带重试的 apt-get update
+          for i in 1 2 3; do
+            sudo apt-get update && break
+            echo "apt-get update 失败，第 $i 次重试..."
+            sleep 10
+          done
+
+          sudo apt-get install -y --no-install-recommends \
+            flex bison libssl-dev bc libelf-dev libncurses-dev \
+            git python3 wget gpg xz-utils
+
+          # 用 LLVM 官方源装 clang-17（Ubuntu 自带版本对 GKI 太旧）
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-17 lld-17 llvm-17
+
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-17 100
+          sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-17 100
+          sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-17 100
+          sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-17 100
+          sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-17 100
+          sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-17 100
+          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-17 100
+
+          clang --version
+          ld.lld --version
+
+      # 2. 拉 GKI 源码（android12-5.10 分支）
       - name: Clone GKI kernel source (android12-5.10)
         run: |
-          # 使用 android12-5.10 分支的 common 内核源码
-          git clone --depth=1 -b android12-5.10 https://android.googlesource.com/kernel/common gki-source
+          git clone --depth=1 -b android12-5.10 \
+            https://android.googlesource.com/kernel/common gki-source
 
-      - name: Download matching vmlinux.symvers (generic)
+      # 3. 配置 GKI 内核（用 LLVM=1 切 clang 工具链）
+      - name: Configure GKI kernel
         run: |
-          # 使用AOSP android12-5.10通用符号表，可能与你设备内核不完全匹配
-          # 如果加载时报符号版本错误，需要从你设备提取 /proc/kallsyms 并生成符号表
-          SYMVERS_URL="https://android.googlesource.com/kernel/common/+/refs/heads/android12-5.10/out/android12-5.10/common/Module.symvers?format=TEXT"
-          wget "$SYMVERS_URL" -O Module.symvers.b64 || true
-          if [ -f Module.symvers.b64 ]; then
-            base64 -d Module.symvers.b64 > gki-source/out/android12-5.10/common/Module.symvers
-          else
-            echo "警告: 无法下载通用符号表，模块可能因符号版本不匹配而无法加载"
-          fi
+          cd gki-source
+          make ARCH=arm64 LLVM=1 O=out gki_defconfig
 
-      - name: Build kernel module
+      # 4. 编译 vmlinux，生成 Module.symvers（外部模块加载的符号版本依据）
+      - name: Build GKI vmlinux (generates Module.symvers)
         run: |
-          make -C gki-source M=$PWD \
+          cd gki-source
+          make ARCH=arm64 LLVM=1 O=out -j$(nproc) vmlinux
+          echo "==== 检查 Module.symvers ===="
+          ls -lh out/Module.symvers
+          head -3 out/Module.symvers
+
+      # 5. 编译外部模块
+      - name: Build external module
+        run: |
+          make -C gki-source \
             ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            KDIR=$PWD/gki-source/out/android12-5.10/common
+            LLVM=1 \
+            M=$PWD \
+            KDIR=$PWD/gki-source/out
+
+          echo "==== 编译产物 ===="
+          ls -lh *.ko
+          file midas_fix.ko
+
+      # 6. 上传 .ko
+      - name: Upload .ko artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: midas_fix-ko
+          path: "*.ko"
+          if-no-files-found: error
