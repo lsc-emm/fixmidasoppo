@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       ddk_image:
-        description: 'DDK镜像tag (默认使用已知可用的2022-03版本)'
+        description: 'DDK镜像tag (默认20260828，失败可尝试2021-11)'
         required: false
-        default: 'ghcr.io/ylarod/ddk-min:android12-5.10-2022-03'
+        default: 'ghcr.io/ylarod/ddk-min:android12-5.10-20260828'
 
 jobs:
   build:
@@ -20,7 +20,7 @@ jobs:
 
       - name: Build .ko with DDK Docker
         run: |
-          IMAGE="${{ inputs.ddk_image || 'ghcr.io/ylarod/ddk-min:android12-5.10-2022-03' }}"
+          IMAGE="${{ inputs.ddk_image || 'ghcr.io/ylarod/ddk-min:android12-5.10-20260828' }}"
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
             -w /work \
