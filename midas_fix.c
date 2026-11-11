@@ -8,13 +8,14 @@ static struct kprobe midas_kp;
 static int midas_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     /*
-     * ARM64 调用约定：bl 指令把返回地址放在 x30(LR)。
-     * kprobe 在函数第一条指令前断下时，regs->pc 是函数入口，
+     * ARM64: bl 把返回地址放在 x30(LR)。
+     * kprobe 在函数入口断下时 regs->pc 是入口地址，
      * regs->regs[30] 是调用者的返回地址。
-     * 把 PC 改成 LR，恢复执行后直接回到调用者，函数体被完全跳过。
+     * 把 PC 改成 LR，return 1 表示不再执行原指令，
+     * 恢复后直接回到调用者，函数体被完全跳过。
      */
     regs->pc = regs->regs[30];
-    return 1; /* 告诉 kprobe 已处理，不再单步原指令 */
+    return 1;
 }
 
 static int __init midas_fix_init(void)
