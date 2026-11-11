@@ -9,68 +9,79 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. 修 apt 源 + 安装 clang/lld 和内核编译依赖
-      - name: Install LLVM and build dependencies
+      # 1. 只检查必需工具，缺了才用 apt（加重试 + 强制 IPv4）
+      - name: Ensure build tools
         run: |
-          # GitHub Actions runner 的 azure/security 源经常 DNS 失败，统一换 archive
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
-            [ -f "$f" ] && sudo sed -i \
-              -e 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
-              -e 's|security.ubuntu.com|archive.ubuntu.com|g' "$f" || true
+          need_apt=0
+          for t in flex bison bc make gcc; do
+            command -v $t >/dev/null 2>&1 || need_apt=1
           done
+          [ -f /usr/include/openssl/ssl.h ] || need_apt=1
+          [ -f /usr/include/elf.h ] || need_apt=1
 
-          # 带重试的 apt-get update
+          if [ "$need_apt" = "1" ]; then
+            echo "部分工具缺失，尝试 apt 安装（强制 IPv4 + 重试）"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+              [ -f "$f" ] && sudo sed -i \
+                -e 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
+                -e 's|security.ubuntu.com|archive.ubuntu.com|g' "$f" || true
+            done
+            for i in 1 2 3; do
+              sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update && break
+              echo "apt update 第 $i 次失败，重试..."
+              sleep 15
+            done
+            sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends \
+              flex bison bc libelf-dev libssl-dev || true
+          else
+            echo "所有必需工具已预装，跳过 apt"
+          fi
+
+      # 2. 从 GitHub Releases 下载 LLVM（不依赖 apt 源）
+      - name: Install clang/lld from LLVM tarball
+        run: |
+          LLVM_VER=17.0.6
+          TARBALL="clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/${TARBALL}"
+
+          # 带重试下载
           for i in 1 2 3; do
-            sudo apt-get update && break
-            echo "apt-get update 失败，第 $i 次重试..."
+            wget -q --timeout=60 --tries=2 "$URL" -O "$TARBALL" && break
+            echo "下载 LLVM 第 $i 次失败，重试..."
             sleep 10
           done
 
-          sudo apt-get install -y --no-install-recommends \
-            flex bison libssl-dev bc libelf-dev libncurses-dev \
-            git python3 wget gpg xz-utils
+          tar -xf "$TARBALL"
+          LLVM_DIR="$PWD/clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-22.04"
+          echo "$LLVM_DIR/bin" >> $GITHUB_PATH
 
-          # 用 LLVM 官方源装 clang-17（Ubuntu 自带版本对 GKI 太旧）
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-17 lld-17 llvm-17
-
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-17 100
-          sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-17 100
-          sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-17 100
-          sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-17 100
-          sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-17 100
-          sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-17 100
-          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-17 100
-
+          # 当前 step 内也生效
+          export PATH="$LLVM_DIR/bin:$PATH"
           clang --version
           ld.lld --version
 
-      # 2. 拉 GKI 源码（android12-5.10 分支）
+      # 3. 拉 GKI 源码
       - name: Clone GKI kernel source (android12-5.10)
         run: |
           git clone --depth=1 -b android12-5.10 \
             https://android.googlesource.com/kernel/common gki-source
 
-      # 3. 配置 GKI 内核（用 LLVM=1 切 clang 工具链）
+      # 4. 配置 GKI
       - name: Configure GKI kernel
         run: |
           cd gki-source
           make ARCH=arm64 LLVM=1 O=out gki_defconfig
 
-      # 4. 编译 vmlinux，生成 Module.symvers（外部模块加载的符号版本依据）
-      - name: Build GKI vmlinux (generates Module.symvers)
+      # 5. 编译 vmlinux 生成 Module.symvers
+      - name: Build GKI vmlinux
         run: |
           cd gki-source
           make ARCH=arm64 LLVM=1 O=out -j$(nproc) vmlinux
-          echo "==== 检查 Module.symvers ===="
+          echo "==== Module.symvers ===="
           ls -lh out/Module.symvers
           head -3 out/Module.symvers
 
-      # 5. 编译外部模块
+      # 6. 编译外部模块
       - name: Build external module
         run: |
           make -C gki-source \
@@ -78,12 +89,10 @@ jobs:
             LLVM=1 \
             M=$PWD \
             KDIR=$PWD/gki-source/out
-
-          echo "==== 编译产物 ===="
           ls -lh *.ko
           file midas_fix.ko
 
-      # 6. 上传 .ko
+      # 7. 上传 .ko
       - name: Upload .ko artifact
         uses: actions/upload-artifact@v4
         with:
