@@ -1,0 +1,37 @@
+name: Build midas_fix.ko (GKI 5.10 Android12)
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev bc
+
+      - name: Clone GKI kernel source (android12-5.10)
+        run: |
+          # 使用 android12-5.10 分支的 common 内核源码
+          git clone --depth=1 -b android12-5.10 https://android.googlesource.com/kernel/common gki-source
+
+      - name: Download matching vmlinux.symvers (generic)
+        run: |
+          # 使用AOSP android12-5.10通用符号表，可能与你设备内核不完全匹配
+          # 如果加载时报符号版本错误，需要从你设备提取 /proc/kallsyms 并生成符号表
+          SYMVERS_URL="https://android.googlesource.com/kernel/common/+/refs/heads/android12-5.10/out/android12-5.10/common/Module.symvers?format=TEXT"
+          wget "$SYMVERS_URL" -O Module.symvers.b64 || true
+          if [ -f Module.symvers.b64 ]; then
+            base64 -d Module.symvers.b64 > gki-source/out/android12-5.10/common/Module.symvers
+          else
+            echo "警告: 无法下载通用符号表，模块可能因符号版本不匹配而无法加载"
+          fi
+
+      - name: Build kernel module
+        run: |
+          make -C gki-source M=$PWD \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KDIR=$PWD/gki-source/out/android12-5.10/common
