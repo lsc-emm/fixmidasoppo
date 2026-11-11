@@ -2,13 +2,13 @@ name: Build midas_fix.ko with DDK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       ddk_image:
-        description: 'DDK Docker image tag (需匹配设备内核日期)'
+        description: 'DDK镜像tag (默认使用已知可用的2022-03版本)'
         required: false
-        default: 'ghcr.io/ylarod/ddk-min:android12-5.10-20221204'
+        default: 'ghcr.io/ylarod/ddk-min:android12-5.10-2022-03'
 
 jobs:
   build:
@@ -16,26 +16,16 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Show DDK image
-        run: |
-          echo "使用镜像: ${{ inputs.ddk_image || 'ghcr.io/ylarod/ddk-min:android12-5.10-20221204' }}"
+      - uses: actions/checkout@v4
 
       - name: Build .ko with DDK Docker
         run: |
-          IMAGE="${{ inputs.ddk_image || 'ghcr.io/ylarod/ddk-min:android12-5.10-20221204' }}"
+          IMAGE="${{ inputs.ddk_image || 'ghcr.io/ylarod/ddk-min:android12-5.10-2022-03' }}"
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
             -w /work \
             "$IMAGE" \
             make
-
-      - name: List build output
-        run: |
-          ls -lh *.ko || true
-          file *.ko || true
 
       - name: Upload .ko artifact
         uses: actions/upload-artifact@v4
